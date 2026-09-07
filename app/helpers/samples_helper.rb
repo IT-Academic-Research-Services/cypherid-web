@@ -1213,6 +1213,13 @@ module SamplesHelper
         .where(tax_ids.present? ? { a: { content: annotation_filters, tax_id: tax_ids } } : { a: { content: annotation_filters } }))
   end
 
+  # Raised when STS is THROTTLING the web-identity federation call (ServiceUnavailable / Throttling),
+  # as opposed to a trust misconfiguration (AccessDenied). The controller maps this to a retryable
+  # 503 + Retry-After instead of a 500, and -- unlike the AccessDenied path -- it deliberately does
+  # NOT fall back to the 1h chained token (that fallback is for a different, trust-not-wired
+  # failure). See SMP-1896.
+  class UploadCredentialsUnavailable < StandardError; end
+
   def get_upload_credentials(samples)
     action = [
       "s3:GetObject",
@@ -1264,14 +1271,24 @@ module SamplesHelper
       # Narrow rescue only: AccessDenied means the env's upload role does not
       # trust web-identity federation yet; Errno::ENOENT means no OIDC token
       # file is mounted (e.g. missing AWS_WEB_IDENTITY_TOKEN_FILE, or ECS).
-      # Any other STS/network error still surfaces as before. Log the class
-      # only (never the token or credentials) so we can see which envs are on
-      # the 1h path.
+      # Throttling is handled separately below; any other STS/network error
+      # still surfaces as before. Log the class only (never the token or
+      # credentials) so we can see which envs are on the 1h path.
       Rails.logger.warn(
         "get_upload_credentials: web-identity federation unavailable (#{e.class}); " \
         "falling back to 1h chained assume_role"
       )
       assume_upload_role_via_chaining(policy_json, session_name)
+    rescue Aws::STS::Errors::ServiceUnavailable, Aws::STS::Errors::Throttling => e
+      # STS is THROTTLING the federation call (not a trust failure), even after the client's
+      # standard-mode retries. Do NOT fall back to chaining: that path is for a trust
+      # misconfiguration and would mint an unnecessary 1h token. Surface a retryable error so the
+      # controller returns 503 + Retry-After and the client can retry the same 12h federation path.
+      # Log the class only, never the token or credentials. See SMP-1896.
+      Rails.logger.warn(
+        "get_upload_credentials: web-identity federation throttled (#{e.class}); signaling retry"
+      )
+      raise UploadCredentialsUnavailable, e.message
     end
   end
 
@@ -1327,6 +1344,13 @@ module SamplesHelper
     Aws::STS::Client.new(
       stub_responses: ENV["OFFLINE"] == "1" || ENV["RAILS_ENV"] == "test",
       credentials: Aws::Credentials.new("", ""),
+      # SMP-1896: standard retry (backoff WITH jitter) instead of the SDK default legacy retry, so a
+      # batch's AssumeRoleWithWebIdentity calls back off on their own jittered schedules rather than
+      # in aligned bursts that amplify an STS throttle. This is orthogonal to the empty static
+      # credentials above (which keep this an unsigned, token-authenticated web-identity call, not
+      # SigV4); retry config never touches auth. max_attempts 5 stays near the legacy default of 4.
+      retry_mode: 'standard',
+      max_attempts: 5
     )
   end
 
