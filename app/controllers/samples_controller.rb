@@ -887,6 +887,17 @@ class SamplesController < ApplicationController
     respond_to do |format|
       format.json { render json: { aws_region: ENV["AWS_REGION"] }.merge(credentials) }
     end
+  rescue SamplesHelper::UploadCredentialsUnavailable
+    # SMP-1896: STS is throttling web-identity federation. Return a retryable 503 with Retry-After
+    # (instead of an opaque 500) so a client that honors it -- e.g. the CLI batch upload that
+    # triggered the throttle -- can back off and retry the same request. NOTE: the web frontend's
+    # get() only auto-retries response-less network errors (api/core.ts isTransientNetworkError), so
+    # a browser upload still surfaces this as a failed sample until a client-side retry/backoff that
+    # honors Retry-After is added; that is a separate change.
+    response.set_header("Retry-After", "5")
+    render json: {
+      error: "Upload credentials are temporarily unavailable due to rate limiting. Please retry.",
+    }, status: :service_unavailable
   end
 
   # GET /samples/1/report_csv
